@@ -1,35 +1,97 @@
 package server_test
 
 import (
+	"bytes"
+	"database/sql"
+	"encoding/base64"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"net/http"
+	"net/http/httptest"
+
 	"github.com/golang-jwt/jwt/v5"
+	_ "modernc.org/sqlite"
+
 	"jwks-server/internal/keys"
 	"jwks-server/internal/server"
 )
 
-func newTestServer(t *testing.T) *server.Server {
+func newTestServer(t *testing.T) (*server.Server, func()) {
 	t.Helper()
-	now := time.Now().UTC()
-	store, err := keys.NewStore(keys.StoreConfig{
-		ExpiredKeyExpiry: now.Add(-1 * time.Hour),
-		ValidKeyExpiry:   now.Add(24 * time.Hour),
-	})
+
+	dbFile := "test_privateKeys.db"
+	_ = os.Remove(dbFile)
+
+	store, err := keys.NewStore(dbFile)
 	if err != nil {
-		t.Fatalf("store init: %v", err)
+		t.Fatalf("failed to create store: %v", err)
 	}
-	return server.New(store)
+
+	cleanup := func() {
+		_ = store.Close()
+		_ = os.Remove(dbFile)
+	}
+
+	return server.New(store), cleanup
 }
 
-func TestJWKSOnlyReturnsActiveKeys(t *testing.T) {
-	srv := newTestServer(t)
+func TestDBFileCreated(t *testing.T) {
+	dbFile := "test_privateKeys.db"
+	_ = os.Remove(dbFile)
 
-	req := httptest.NewRequest(http.MethodGet, "/jwks", nil)
+	store, err := keys.NewStore(dbFile)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer func() {
+		_ = store.Close()
+		_ = os.Remove(dbFile)
+	}()
+
+	if _, err := os.Stat(dbFile); err != nil {
+		t.Fatalf("expected DB file to exist: %v", err)
+	}
+}
+
+func TestDBSchemaExists(t *testing.T) {
+	dbFile := "test_privateKeys.db"
+	_ = os.Remove(dbFile)
+
+	store, err := keys.NewStore(dbFile)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer func() {
+		_ = store.Close()
+		_ = os.Remove(dbFile)
+	}()
+
+	db, err := sql.Open("sqlite", dbFile)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	var name string
+	err = db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='keys'`).Scan(&name)
+	if err != nil {
+		t.Fatalf("expected keys table to exist: %v", err)
+	}
+
+	if name != "keys" {
+		t.Fatalf("expected table name keys, got %s", name)
+	}
+}
+
+func TestJWKSOnlyReturnsValidKeys(t *testing.T) {
+	srv, cleanup := newTestServer(t)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/jwks.json", nil)
 	w := httptest.NewRecorder()
 
 	srv.HandleJWKS(w, req)
@@ -44,54 +106,100 @@ func TestJWKSOnlyReturnsActiveKeys(t *testing.T) {
 	}
 
 	if len(jwksResp.Keys) != 1 {
-		t.Fatalf("expected 1 active key, got %d", len(jwksResp.Keys))
+		t.Fatalf("expected 1 valid key in JWKS, got %d", len(jwksResp.Keys))
 	}
-	if jwksResp.Keys[0].Kid == "" || jwksResp.Keys[0].N == "" || jwksResp.Keys[0].E == "" {
-		t.Fatal("expected jwk to have kid, n, e")
+
+	k := jwksResp.Keys[0]
+	if k.Kid == "" || k.N == "" || k.E == "" {
+		t.Fatal("expected kid, n, and e to be populated")
 	}
 }
 
-func TestAuthIssuesValidJWTWithKid(t *testing.T) {
-	srv := newTestServer(t)
+func TestAuthWithBasicAuthReturnsJWT(t *testing.T) {
+	srv, cleanup := newTestServer(t)
+	defer cleanup()
+
+	auth := base64.StdEncoding.EncodeToString([]byte("abc:def"))
+	req := httptest.NewRequest(http.MethodPost, "/auth", nil)
+	req.Header.Set("Authorization", "Basic "+auth)
+
+	w := httptest.NewRecorder()
+	srv.HandleAuth(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	tokenStr := strings.TrimSpace(w.Body.String())
+	if tokenStr == "" {
+		t.Fatal("expected token body")
+	}
+
+	tok, _, err := jwt.NewParser().ParseUnverified(tokenStr, jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("parse token: %v", err)
+	}
+
+	if tok.Header["kid"] == "" {
+		t.Fatal("expected kid header")
+	}
+}
+
+func TestAuthWithJSONReturnsJWT(t *testing.T) {
+	srv, cleanup := newTestServer(t)
+	defer cleanup()
+
+	body := []byte(`{"username":"userABC","password":"password123"}`)
+	req := httptest.NewRequest(http.MethodPost, "/auth", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	srv.HandleAuth(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+}
+
+func TestAuthRejectsBadJSONCredentials(t *testing.T) {
+	srv, cleanup := newTestServer(t)
+	defer cleanup()
+
+	body := []byte(`{"username":"wrong","password":"wrong"}`)
+	req := httptest.NewRequest(http.MethodPost, "/auth", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	srv.HandleAuth(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestAuthRejectsNoCredentials(t *testing.T) {
+	srv, cleanup := newTestServer(t)
+	defer cleanup()
 
 	req := httptest.NewRequest(http.MethodPost, "/auth", nil)
 	w := httptest.NewRecorder()
 
 	srv.HandleAuth(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
-	}
-
-	tokenStr := strings.TrimSpace(w.Body.String())
-	parser := jwt.NewParser()
-
-	// Parse without verifying first; we only check it is well-formed and has kid.
-	tok, _, err := parser.ParseUnverified(tokenStr, jwt.MapClaims{})
-	if err != nil {
-		t.Fatalf("parse unverified: %v", err)
-	}
-
-	kid, ok := tok.Header["kid"].(string)
-	if !ok || kid == "" {
-		t.Fatal("expected kid in JWT header")
-	}
-
-	claims, ok := tok.Claims.(jwt.MapClaims)
-	if !ok {
-		t.Fatal("expected map claims")
-	}
-	if claims["sub"] != "fake-user" {
-		t.Fatalf("expected sub=fake-user, got %v", claims["sub"])
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", w.Code)
 	}
 }
 
-func TestAuthExpiredQueryIssuesExpiredToken(t *testing.T) {
-	srv := newTestServer(t)
+func TestExpiredQueryReturnsExpiredJWT(t *testing.T) {
+	srv, cleanup := newTestServer(t)
+	defer cleanup()
 
+	auth := base64.StdEncoding.EncodeToString([]byte("abc:def"))
 	req := httptest.NewRequest(http.MethodPost, "/auth?expired=true", nil)
-	w := httptest.NewRecorder()
+	req.Header.Set("Authorization", "Basic "+auth)
 
+	w := httptest.NewRecorder()
 	srv.HandleAuth(w, req)
 
 	if w.Code != http.StatusOK {
@@ -99,12 +207,14 @@ func TestAuthExpiredQueryIssuesExpiredToken(t *testing.T) {
 	}
 
 	tokenStr := strings.TrimSpace(w.Body.String())
+
 	tok, _, err := jwt.NewParser().ParseUnverified(tokenStr, jwt.MapClaims{})
 	if err != nil {
-		t.Fatalf("parse unverified: %v", err)
+		t.Fatalf("parse token: %v", err)
 	}
 
 	claims := tok.Claims.(jwt.MapClaims)
+
 	expF, ok := claims["exp"].(float64)
 	if !ok {
 		t.Fatal("expected exp claim")
@@ -112,26 +222,25 @@ func TestAuthExpiredQueryIssuesExpiredToken(t *testing.T) {
 
 	exp := time.Unix(int64(expF), 0).UTC()
 	if !exp.Before(time.Now().UTC()) {
-		t.Fatalf("expected expired exp, got %v", exp)
+		t.Fatalf("expected expired token, got exp=%v", exp)
 	}
 }
 
 func TestMethodGuards(t *testing.T) {
-	srv := newTestServer(t)
+	srv, cleanup := newTestServer(t)
+	defer cleanup()
 
-	// /jwks must be GET
-	req := httptest.NewRequest(http.MethodPost, "/jwks", nil)
-	w := httptest.NewRecorder()
-	srv.HandleJWKS(w, req)
-	if w.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("jwks method guard expected 405, got %d", w.Code)
+	req1 := httptest.NewRequest(http.MethodPost, "/.well-known/jwks.json", nil)
+	w1 := httptest.NewRecorder()
+	srv.HandleJWKS(w1, req1)
+	if w1.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for jwks, got %d", w1.Code)
 	}
 
-	// /auth must be POST
 	req2 := httptest.NewRequest(http.MethodGet, "/auth", nil)
 	w2 := httptest.NewRecorder()
 	srv.HandleAuth(w2, req2)
 	if w2.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("auth method guard expected 405, got %d", w2.Code)
+		t.Fatalf("expected 405 for auth, got %d", w2.Code)
 	}
 }
