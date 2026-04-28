@@ -22,6 +22,7 @@ import (
 
 func newTestServer(t *testing.T) (*server.Server, func()) {
 	t.Helper()
+	t.Setenv("NOT_MY_KEY", "test-secret-key-for-aes-encryption")
 
 	dbFile := "test_privateKeys.db"
 	_ = os.Remove(dbFile)
@@ -40,6 +41,7 @@ func newTestServer(t *testing.T) (*server.Server, func()) {
 }
 
 func TestDBFileCreated(t *testing.T) {
+	t.Setenv("NOT_MY_KEY", "test-secret-key-for-aes-encryption")
 	dbFile := "test_privateKeys.db"
 	_ = os.Remove(dbFile)
 
@@ -58,6 +60,7 @@ func TestDBFileCreated(t *testing.T) {
 }
 
 func TestDBSchemaExists(t *testing.T) {
+	t.Setenv("NOT_MY_KEY", "test-secret-key-for-aes-encryption")
 	dbFile := "test_privateKeys.db"
 	_ = os.Remove(dbFile)
 
@@ -244,3 +247,55 @@ func TestMethodGuards(t *testing.T) {
 		t.Fatalf("expected 405 for auth, got %d", w2.Code)
 	}
 }
+
+func TestRegisterCreatesUserAndReturnsUUIDPassword(t *testing.T) {
+	srv, cleanup := newTestServer(t)
+	defer cleanup()
+
+	body := []byte(`{"username":"alice","email":"alice@example.com"}`)
+	req := httptest.NewRequest(http.MethodPost, "/register", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.HandleRegister(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", w.Code)
+	}
+
+	var resp map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode register response: %v", err)
+	}
+
+	if len(resp["password"]) != 36 {
+		t.Fatalf("expected UUIDv4 password, got %q", resp["password"])
+	}
+}
+
+func TestRegisteredUserCanAuthenticateAndLogRequest(t *testing.T) {
+	srv, cleanup := newTestServer(t)
+	defer cleanup()
+
+	body := []byte(`{"username":"bob","email":"bob@example.com"}`)
+	req := httptest.NewRequest(http.MethodPost, "/register", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.HandleRegister(w, req)
+
+	var resp map[string]string
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+
+	authBody := []byte(`{"username":"bob","password":"` + resp["password"] + `"}`)
+	authReq := httptest.NewRequest(http.MethodPost, "/auth", bytes.NewReader(authBody))
+	authReq.Header.Set("Content-Type", "application/json")
+	authReq.RemoteAddr = "192.0.2.1:1234"
+	authW := httptest.NewRecorder()
+
+	srv.HandleAuth(authW, authReq)
+
+	if authW.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", authW.Code)
+	}
+}
+
