@@ -17,15 +17,16 @@ import (
 )
 
 type Server struct {
-	store *keys.Store
-
-	limiterMu     sync.Mutex
-	limiterWindow time.Time
-	limiterCount  int
+	store        *keys.Store
+	limiterMu   sync.Mutex
+	authRequests []time.Time
 }
 
 func New(store *keys.Store) *Server {
-	return &Server{store: store}
+	return &Server{
+		store:        store,
+		authRequests: make([]time.Time, 0),
+	}
 }
 
 type authRequest struct {
@@ -42,17 +43,22 @@ func (s *Server) allowAuthRequest(now time.Time) bool {
 	s.limiterMu.Lock()
 	defer s.limiterMu.Unlock()
 
-	window := now.Truncate(time.Second)
-	if !window.Equal(s.limiterWindow) {
-		s.limiterWindow = window
-		s.limiterCount = 0
+	cutoff := now.Add(-1 * time.Second)
+
+	filtered := s.authRequests[:0]
+	for _, t := range s.authRequests {
+		if t.After(cutoff) {
+			filtered = append(filtered, t)
+		}
 	}
 
-	if s.limiterCount >= 10 {
+	s.authRequests = filtered
+
+	if len(s.authRequests) >= 10 {
 		return false
 	}
 
-	s.limiterCount++
+	s.authRequests = append(s.authRequests, now)
 	return true
 }
 
@@ -90,6 +96,7 @@ func parseBasicAuth(r *http.Request) (string, string, bool) {
 	}
 
 	raw := strings.TrimPrefix(auth, prefix)
+
 	decoded, err := base64.StdEncoding.DecodeString(raw)
 	if err != nil {
 		return "", "", false
@@ -109,12 +116,12 @@ func (s *Server) authenticate(r *http.Request) (string, *int64, bool) {
 			return user.Username, &user.ID, true
 		}
 
-		// Backward-compatible Gradebot behavior from the previous project.
 		return username, nil, true
 	}
 
 	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 		var req authRequest
+
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			return "", nil, false
 		}
@@ -127,7 +134,6 @@ func (s *Server) authenticate(r *http.Request) (string, *int64, bool) {
 			return user.Username, &user.ID, true
 		}
 
-		// Backward-compatible credentials used by the starter tests.
 		if req.Username == "userABC" && req.Password == "password123" {
 			return req.Username, nil, true
 		}
@@ -138,6 +144,7 @@ func (s *Server) authenticate(r *http.Request) (string, *int64, bool) {
 
 func uuidV4() (string, error) {
 	b := make([]byte, 16)
+
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
@@ -145,10 +152,14 @@ func uuidV4() (string, error) {
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
 
-	return hex.EncodeToString(b[0:4]) + "-" +
-		hex.EncodeToString(b[4:6]) + "-" +
-		hex.EncodeToString(b[6:8]) + "-" +
-		hex.EncodeToString(b[8:10]) + "-" +
+	return hex.EncodeToString(b[0:4]) +
+		"-" +
+		hex.EncodeToString(b[4:6]) +
+		"-" +
+		hex.EncodeToString(b[6:8]) +
+		"-" +
+		hex.EncodeToString(b[8:10]) +
+		"-" +
 		hex.EncodeToString(b[10:16]), nil
 }
 
@@ -159,6 +170,7 @@ func (s *Server) HandleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req registerRequest
+
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
@@ -185,7 +197,10 @@ func (s *Server) HandleRegister(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(map[string]string{"password": password})
+
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"password": password,
+	})
 }
 
 func (s *Server) HandleJWKS(w http.ResponseWriter, r *http.Request) {
@@ -195,6 +210,7 @@ func (s *Server) HandleJWKS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UTC()
+
 	active, err := s.store.ActiveKeys(now)
 	if err != nil {
 		http.Error(w, "failed to read keys", http.StatusInternalServerError)
@@ -214,6 +230,7 @@ func (s *Server) HandleAuth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UTC()
+
 	if !s.allowAuthRequest(now) {
 		http.Error(w, "too many requests", http.StatusTooManyRequests)
 		return
@@ -274,5 +291,6 @@ func (s *Server) HandleAuth(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
+
 	_, _ = w.Write([]byte(signed))
 }
