@@ -1,3 +1,4 @@
 *.db
 test_privateKeys.db
 coverage.out
+.env
